@@ -1,9 +1,14 @@
 package l4proxy
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -143,6 +148,195 @@ func TestDialPeersUsesConfiguredLocalPortUDP(t *testing.T) {
 	}
 	if localUDPAddr.Port != localPort {
 		t.Fatalf("expected local udp port %d, got %d", localPort, localUDPAddr.Port)
+	}
+}
+
+func TestDialPeersDirectWithoutNetworkProxy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening for upstream: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := ln.Accept(); err == nil {
+			accepted <- conn
+		}
+	}()
+
+	parsedUpstream, err := caddy.ParseNetworkAddress(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("parsing upstream address: %v", err)
+	}
+
+	h := &Handler{logger: zap.NewExample()}
+	upstream := &Upstream{
+		peers: []*peer{{address: &parsedUpstream}},
+	}
+
+	downClient, downServer := net.Pipe()
+	defer downClient.Close()
+	defer downServer.Close()
+	down := layer4.WrapConnection(downServer, nil, h.logger)
+	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
+
+	upConns, err := h.dialPeers(upstream, repl, down)
+	if err != nil {
+		t.Fatalf("dialPeers: %v", err)
+	}
+	defer func() {
+		for _, c := range upConns {
+			c.Close()
+		}
+		select {
+		case conn := <-accepted:
+			conn.Close()
+		default:
+		}
+	}()
+
+	select {
+	case conn := <-accepted:
+		conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatalf("upstream did not receive direct connection")
+	}
+}
+
+func TestDialPeersSOCKS5NetworkProxyReceivesExplicitTarget(t *testing.T) {
+	proxyAddr, targetCh, closeProxy := startTestSOCKS5Proxy(t)
+	defer closeProxy()
+
+	h := &Handler{logger: zap.NewExample()}
+	upstream := provisionTestUpstream(t, h, &Upstream{
+		Dial: []string{"example.test:443"},
+		NetworkProxy: &NetworkProxy{
+			From: "socks5",
+			Dial: []string{proxyAddr},
+		},
+	})
+
+	downClient, downServer := net.Pipe()
+	defer downClient.Close()
+	defer downServer.Close()
+	down := layer4.WrapConnection(downServer, nil, h.logger)
+	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
+
+	upConns, err := h.dialPeers(upstream, repl, down)
+	if err != nil {
+		t.Fatalf("dialPeers: %v", err)
+	}
+	defer closeAll(upConns)
+
+	select {
+	case got := <-targetCh:
+		if got != "example.test:443" {
+			t.Fatalf("SOCKS5 proxy saw target %q, want %q", got, "example.test:443")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("SOCKS5 proxy did not receive a target")
+	}
+}
+
+func TestDialPeersHTTPNetworkProxyReceivesExplicitTarget(t *testing.T) {
+	proxyURL, targetCh, closeProxy := startTestHTTPConnectProxy(t)
+	defer closeProxy()
+
+	h := &Handler{logger: zap.NewExample()}
+	upstream := provisionTestUpstream(t, h, &Upstream{
+		Dial: []string{"example.test:8443"},
+		NetworkProxy: &NetworkProxy{
+			From: "url",
+			URL:  proxyURL,
+		},
+	})
+
+	downClient, downServer := net.Pipe()
+	defer downClient.Close()
+	defer downServer.Close()
+	down := layer4.WrapConnection(downServer, nil, h.logger)
+	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
+
+	upConns, err := h.dialPeers(upstream, repl, down)
+	if err != nil {
+		t.Fatalf("dialPeers: %v", err)
+	}
+	defer closeAll(upConns)
+
+	select {
+	case got := <-targetCh:
+		if got != "example.test:8443" {
+			t.Fatalf("HTTP proxy saw target %q, want %q", got, "example.test:8443")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("HTTP proxy did not receive a target")
+	}
+}
+
+func TestDialPeersNetworkProxyInfersHostOnlyTargetPort(t *testing.T) {
+	proxyURL, targetCh, closeProxy := startTestHTTPConnectProxy(t)
+	defer closeProxy()
+
+	h := &Handler{logger: zap.NewExample()}
+	upstream := provisionTestUpstream(t, h, &Upstream{
+		Dial: []string{"example.test"},
+		NetworkProxy: &NetworkProxy{
+			From: "url",
+			URL:  proxyURL,
+		},
+	})
+
+	downClient, downServer := net.Pipe()
+	defer downClient.Close()
+	defer downServer.Close()
+	down := layer4.WrapConnection(&localAddrConn{
+		Conn:      downServer,
+		localAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9443},
+	}, nil, h.logger)
+	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
+
+	upConns, err := h.dialPeers(upstream, repl, down)
+	if err != nil {
+		t.Fatalf("dialPeers: %v", err)
+	}
+	defer closeAll(upConns)
+
+	select {
+	case got := <-targetCh:
+		if got != "example.test:9443" {
+			t.Fatalf("HTTP proxy saw inferred target %q, want %q", got, "example.test:9443")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("HTTP proxy did not receive a target")
+	}
+}
+
+func TestDialPeersNetworkProxyHostOnlyTargetRequiresInboundPort(t *testing.T) {
+	proxyURL, _, closeProxy := startTestHTTPConnectProxy(t)
+	defer closeProxy()
+
+	h := &Handler{logger: zap.NewExample()}
+	upstream := provisionTestUpstream(t, h, &Upstream{
+		Dial: []string{"example.test"},
+		NetworkProxy: &NetworkProxy{
+			From: "url",
+			URL:  proxyURL,
+		},
+	})
+
+	downClient, downServer := net.Pipe()
+	defer downClient.Close()
+	defer downServer.Close()
+	down := layer4.WrapConnection(downServer, nil, h.logger)
+	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
+
+	_, err := h.dialPeers(upstream, repl, down)
+	if err == nil {
+		t.Fatalf("expected host-only target without inbound port to fail")
+	}
+	if !strings.Contains(err.Error(), "inbound local address") || !strings.Contains(err.Error(), "port") {
+		t.Fatalf("expected clear inbound port error, got: %v", err)
 	}
 }
 
@@ -494,5 +688,266 @@ func TestActiveHealthCheckUsesLocalAddress(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("no health check connection observed")
+	}
+}
+
+func TestActiveHealthCheckUsesNetworkProxy(t *testing.T) {
+	proxyURL, targetCh, closeProxy := startTestHTTPConnectProxy(t)
+	defer closeProxy()
+
+	h := &Handler{
+		logger: zap.NewExample(),
+		HealthChecks: &HealthChecks{
+			Active: &ActiveHealthChecks{
+				Timeout: caddy.Duration(200 * time.Millisecond),
+				logger:  zap.NewExample(),
+			},
+		},
+	}
+	upstream := provisionTestUpstream(t, h, &Upstream{
+		Dial: []string{"example.test:443"},
+		NetworkProxy: &NetworkProxy{
+			From: "url",
+			URL:  proxyURL,
+		},
+	})
+	if _, err := upstream.peers[0].setHealthy(false); err != nil {
+		t.Fatalf("mark peer unhealthy before check: %v", err)
+	}
+
+	if err := h.doActiveHealthCheck(upstream, upstream.peers[0]); err != nil {
+		t.Fatalf("active health check: %v", err)
+	}
+
+	select {
+	case got := <-targetCh:
+		if got != "example.test:443" {
+			t.Fatalf("HTTP proxy saw health check target %q, want %q", got, "example.test:443")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("HTTP proxy did not receive a health check target")
+	}
+	if !upstream.peers[0].healthy() {
+		t.Fatalf("expected proxied active health check to mark peer healthy")
+	}
+}
+
+func TestActiveHealthCheckNetworkProxyHostOnlyRequiresHealthPort(t *testing.T) {
+	proxyURL, _, closeProxy := startTestHTTPConnectProxy(t)
+	defer closeProxy()
+
+	h := &Handler{
+		logger: zap.NewExample(),
+		HealthChecks: &HealthChecks{
+			Active: &ActiveHealthChecks{
+				Timeout: caddy.Duration(200 * time.Millisecond),
+				logger:  zap.NewExample(),
+			},
+		},
+	}
+	upstream := provisionTestUpstream(t, h, &Upstream{
+		Dial: []string{"example.test"},
+		NetworkProxy: &NetworkProxy{
+			From: "url",
+			URL:  proxyURL,
+		},
+	})
+
+	err := h.doActiveHealthCheck(upstream, upstream.peers[0])
+	if err == nil {
+		t.Fatalf("expected host-only proxied active health check without health_port to fail")
+	}
+	if !strings.Contains(err.Error(), "health_port") || !strings.Contains(err.Error(), "no inbound connection") {
+		t.Fatalf("expected clear health_port error, got: %v", err)
+	}
+}
+
+func TestActiveHealthCheckNetworkProxyHostOnlyUsesHealthPort(t *testing.T) {
+	proxyURL, targetCh, closeProxy := startTestHTTPConnectProxy(t)
+	defer closeProxy()
+
+	h := &Handler{
+		logger: zap.NewExample(),
+		HealthChecks: &HealthChecks{
+			Active: &ActiveHealthChecks{
+				Port:    8443,
+				Timeout: caddy.Duration(200 * time.Millisecond),
+				logger:  zap.NewExample(),
+			},
+		},
+	}
+	upstream := provisionTestUpstream(t, h, &Upstream{
+		Dial: []string{"example.test"},
+		NetworkProxy: &NetworkProxy{
+			From: "url",
+			URL:  proxyURL,
+		},
+	})
+
+	if err := h.doActiveHealthCheck(upstream, upstream.peers[0]); err != nil {
+		t.Fatalf("active health check: %v", err)
+	}
+
+	select {
+	case got := <-targetCh:
+		if got != "example.test:8443" {
+			t.Fatalf("HTTP proxy saw health check target %q, want %q", got, "example.test:8443")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("HTTP proxy did not receive a health check target")
+	}
+}
+
+type localAddrConn struct {
+	net.Conn
+	localAddr net.Addr
+}
+
+func (c *localAddrConn) LocalAddr() net.Addr {
+	return c.localAddr
+}
+
+func provisionTestUpstream(t *testing.T, h *Handler, u *Upstream) *Upstream {
+	t.Helper()
+	for _, dialAddr := range u.Dial {
+		t.Cleanup(func() { _, _ = peers.Delete(dialAddr) })
+	}
+	if err := u.provision(caddy.Context{}, h); err != nil {
+		t.Fatalf("provision upstream: %v", err)
+	}
+	return u
+}
+
+func closeAll(conns []net.Conn) {
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func startTestHTTPConnectProxy(t *testing.T) (string, <-chan string, func()) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen HTTP CONNECT proxy: %v", err)
+	}
+
+	targetCh := make(chan string, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		targetCh <- req.Host
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		_, _ = io.Copy(io.Discard, br)
+	}()
+
+	closeProxy := func() {
+		_ = ln.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	return "http://" + ln.Addr().String(), targetCh, closeProxy
+}
+
+func startTestSOCKS5Proxy(t *testing.T) (string, <-chan string, func()) {
+	t.Helper()
+
+	socketPath := t.TempDir() + "/socks.sock"
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen SOCKS5 proxy: %v", err)
+	}
+
+	targetCh := make(chan string, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		header := make([]byte, 2)
+		if _, err := io.ReadFull(br, header); err != nil {
+			return
+		}
+		methods := make([]byte, int(header[1]))
+		if _, err := io.ReadFull(br, methods); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+			return
+		}
+
+		request := make([]byte, 4)
+		if _, err := io.ReadFull(br, request); err != nil {
+			return
+		}
+		if request[1] != 0x01 {
+			return
+		}
+
+		host, err := readSOCKS5Host(br, request[3])
+		if err != nil {
+			return
+		}
+		portBytes := make([]byte, 2)
+		if _, err := io.ReadFull(br, portBytes); err != nil {
+			return
+		}
+		targetCh <- net.JoinHostPort(host, fmt.Sprint(binary.BigEndian.Uint16(portBytes)))
+
+		_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = io.Copy(io.Discard, br)
+	}()
+
+	closeProxy := func() {
+		_ = ln.Close()
+		_ = os.Remove(socketPath)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	return "unix/" + socketPath, targetCh, closeProxy
+}
+
+func readSOCKS5Host(r io.Reader, atyp byte) (string, error) {
+	switch atyp {
+	case 0x01:
+		ip := make([]byte, net.IPv4len)
+		_, err := io.ReadFull(r, ip)
+		return net.IP(ip).String(), err
+	case 0x03:
+		var length [1]byte
+		if _, err := io.ReadFull(r, length[:]); err != nil {
+			return "", err
+		}
+		host := make([]byte, int(length[0]))
+		_, err := io.ReadFull(r, host)
+		return string(host), err
+	case 0x04:
+		ip := make([]byte, net.IPv6len)
+		_, err := io.ReadFull(r, ip)
+		return net.IP(ip).String(), err
+	default:
+		return "", fmt.Errorf("unknown SOCKS5 address type %d", atyp)
 	}
 }

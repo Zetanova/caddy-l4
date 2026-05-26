@@ -134,21 +134,26 @@ func (h *Handler) doActiveHealthCheck(upstream *Upstream, p *peer) error {
 	if addr == nil {
 		return nil
 	}
+	portWasOmitted := p.portWasOmitted
 
 	// adjust the port, if configured to be different
 	if h.HealthChecks.Active.Port > 0 {
 		addr.StartPort = uint(h.HealthChecks.Active.Port) //nolint:gosec // disable G115
 		addr.EndPort = addr.StartPort
+		portWasOmitted = false
 	}
 
-	hostPort := addr.JoinHostPort(0)
+	hostPort, err := healthCheckHostPort(addr, portWasOmitted, upstream.NetworkProxy != nil)
+	if err != nil {
+		return err
+	}
 	timeout := time.Duration(h.HealthChecks.Active.Timeout)
 
 	// Resolve the destination address family only when it will actually be used,
 	// i.e. when the user has configured local_address or resolver_preference.
 	// Otherwise skip it to avoid an extra DNS lookup per health check for hostname upstreams.
 	var destFam int
-	if len(upstream.localAddrs) > 0 || upstream.ResolverPreference != "" {
+	if upstream.NetworkProxy == nil && (len(upstream.localAddrs) > 0 || upstream.ResolverPreference != "") {
 		var famErr error
 		destFam, famErr = resolveDestFamily(addr.Network, hostPort, upstream.ResolverPreference)
 		if famErr != nil {
@@ -165,8 +170,9 @@ func (h *Handler) doActiveHealthCheck(upstream *Upstream, p *peer) error {
 	defer cancel()
 
 	var conn net.Conn
-	var err error
-	if len(localAddrs) == 0 {
+	if upstream.NetworkProxy != nil {
+		conn, err = upstream.NetworkProxy.dial(ctx, caddy.NewReplacer(), upstream.localAddrs, upstream.ResolverPreference, addr.Network, hostPort, h.logger)
+	} else if len(localAddrs) == 0 {
 		var d net.Dialer
 		d.Timeout = timeout
 		conn, err = d.DialContext(ctx, dialNetwork, hostPort)
@@ -202,4 +208,11 @@ func (h *Handler) doActiveHealthCheck(upstream *Upstream, p *peer) error {
 	}
 
 	return nil
+}
+
+func healthCheckHostPort(addr *caddy.NetworkAddress, portWasOmitted bool, usingNetworkProxy bool) (string, error) {
+	if !usingNetworkProxy || !portWasOmitted || caddy.IsUnixNetwork(addr.Network) || caddy.IsFdNetwork(addr.Network) {
+		return addr.JoinHostPort(0), nil
+	}
+	return "", fmt.Errorf("active health check for upstream %q is missing a target port; configure health_port because no inbound connection is available for port inference", addr.Host)
 }

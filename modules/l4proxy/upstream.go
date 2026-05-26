@@ -79,6 +79,9 @@ type Upstream struct {
 	// cross-family fallback and are not subject to that compatibility check.
 	ResolverPreference string `json:"resolver_preference,omitempty"`
 
+	// NetworkProxy configures an optional next-hop proxy for dialing this upstream.
+	NetworkProxy *NetworkProxy `json:"network_proxy,omitempty"`
+
 	// Set this field to enable TLS to the upstream.
 	TLS *reverseproxy.TLSConfig `json:"tls,omitempty"`
 
@@ -100,6 +103,8 @@ func (u *Upstream) String() string {
 }
 
 func (u *Upstream) provision(ctx caddy.Context, h *Handler) error {
+	repl := caddy.NewReplacer()
+
 	// Validate resolver_preference early: must be one of the known values or empty (default).
 	switch u.ResolverPreference {
 	case "", "ipv4_only", "ipv6_only", "ipv4_first", "ipv6_first":
@@ -108,7 +113,12 @@ func (u *Upstream) provision(ctx caddy.Context, h *Handler) error {
 		return fmt.Errorf("resolver_preference: unknown value %q; must be one of: ipv4_only, ipv6_only, ipv4_first, ipv6_first", u.ResolverPreference)
 	}
 
-	repl := caddy.NewReplacer()
+	if u.NetworkProxy != nil {
+		if err := u.NetworkProxy.provision(repl); err != nil {
+			return err
+		}
+	}
+
 	for _, dialAddr := range u.Dial {
 		// Replace runtime placeholders.
 		// Note: ReplaceKnown is used here instead of ReplaceAll to let unknown placeholders be replaced later
@@ -116,7 +126,10 @@ func (u *Upstream) provision(ctx caddy.Context, h *Handler) error {
 		replDialAddr := repl.ReplaceKnown(dialAddr, "")
 
 		// Create or load peer info
-		p := &peer{dialAddr: replDialAddr}
+		p := &peer{
+			dialAddr:       replDialAddr,
+			portWasOmitted: networkAddressPortOmitted(replDialAddr),
+		}
 		// Parse and validate the dial address if the upstream isn't dynamic.
 		// If the upstream address contains placeholders, skip parsing here,
 		// then do it after replacing all placeholders in Handler.dialPeers.
@@ -133,6 +146,16 @@ func (u *Upstream) provision(ctx caddy.Context, h *Handler) error {
 			p = existingPeer.(*peer)
 		}
 		u.peers = append(u.peers, p)
+	}
+
+	if u.NetworkProxy != nil {
+		for _, p := range u.peers {
+			if p.address != nil {
+				if err := requireTCPNetworkProxyTarget(p.address.Network); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	// Reject local_address for Unix socket upstreams. Peers whose addresses contain
@@ -287,6 +310,10 @@ func (u *Upstream) totalConns() int {
 //	upstream [<address:port>] {
 //		dial <address:port> [<address:port>]
 //		local_addr <address[:port]> [<address[:port]>]
+//		network_proxy socks5 {
+//			dial <proxy_address>
+//		}
+//		network_proxy url <http_proxy_url>
 //		resolver_preference <ipv4_only|ipv6_only|ipv4_first|ipv6_first>
 //		max_connections <int>
 //
@@ -313,6 +340,7 @@ func (u *Upstream) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		hasTLSInsecureSkipVerify, hasTLSTimeout bool
 		hasTLSRenegotiation, hasTLSServerName   bool
 		hasResolverPreference                   bool
+		hasNetworkProxy                         bool
 	)
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		optionName := d.Val()
@@ -343,6 +371,15 @@ func (u *Upstream) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			u.LocalAddrs = append(u.LocalAddrs, d.RemainingArgs()...)
+		case "network_proxy":
+			if hasNetworkProxy {
+				return d.Errf("duplicate %s option '%s'", wrapper, optionName)
+			}
+			np := &NetworkProxy{}
+			if err := np.UnmarshalCaddyfile(d.NewFromNextSegment()); err != nil {
+				return err
+			}
+			u.NetworkProxy, hasNetworkProxy = np, true
 		case "max_connections":
 			if hasMaxConnections {
 				return d.Errf("duplicate %s option '%s'", wrapper, optionName)
@@ -509,6 +546,8 @@ type peer struct {
 	fails     atomic.Int32
 	address   *caddy.NetworkAddress
 	dialAddr  string
+
+	portWasOmitted bool
 }
 
 // getNumConns returns the number of active connections with the peer.

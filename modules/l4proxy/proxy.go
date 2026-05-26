@@ -228,31 +228,19 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
 		// For dynamic dial addresses (with runtime placeholders) the address was
 		// not pre-parsed at provision; resolve it per-connection here.
 		addr := p.address
+		portWasOmitted := p.portWasOmitted
 		if addr == nil {
-			addr, err = parseAddress(repl.ReplaceAll(p.dialAddr, ""))
+			replDialAddr := repl.ReplaceAll(p.dialAddr, "")
+			portWasOmitted = networkAddressPortOmitted(replDialAddr)
+			addr, err = parseAddress(replDialAddr)
 			if err != nil {
 				return nil, err
 			}
 		}
-		hostPort := addr.JoinHostPort(0)
-
-		// Resolve the destination address family only when it will actually be used,
-		// i.e. when the user has configured local_address or resolver_preference.
-		// Otherwise skip it to avoid an extra DNS lookup per dial for hostname upstreams.
-		var destFam int
-		if len(upstream.localAddrs) > 0 || upstream.ResolverPreference != "" {
-			var famErr error
-			destFam, famErr = resolveDestFamily(addr.Network, hostPort, upstream.ResolverPreference)
-			if famErr != nil {
-				return nil, famErr
-			}
+		hostPort, err := upstreamHostPort(addr, portWasOmitted, down.LocalAddr(), upstream.NetworkProxy != nil)
+		if err != nil {
+			return nil, err
 		}
-		// Narrow the dial network to the resolved family so that resolver_preference
-		// is enforced at Dial time rather than left to Go's Happy Eyeballs default
-		// (which prefers IPv6 on dual-stack targets). When destFam == 0 (both new
-		// features unset), dialNetwork is left as addr.Network for full backward
-		// compat. Already-specific networks (tcp4/tcp6/udp4/udp6/unix*) are untouched.
-		dialNetwork := narrowNetworkForFamily(addr.Network, destFam)
 
 		var resolvedLocalAddrs []string
 		if len(upstream.localAddrs) > 0 {
@@ -261,10 +249,35 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
 				resolvedLocalAddrs = append(resolvedLocalAddrs, repl.ReplaceAll(la, ""))
 			}
 		}
-		localAddrs := buildLocalAddrs(resolvedLocalAddrs, dialNetwork, destFam, h.logger)
+		dialNetwork := addr.Network
+		var localAddrs []net.Addr
+		if upstream.NetworkProxy == nil {
+			// Resolve the destination address family only when it will actually be used,
+			// i.e. when the user has configured local_address or resolver_preference.
+			// Otherwise skip it to avoid an extra DNS lookup per dial for hostname upstreams.
+			var destFam int
+			if len(upstream.localAddrs) > 0 || upstream.ResolverPreference != "" {
+				var famErr error
+				destFam, famErr = resolveDestFamily(addr.Network, hostPort, upstream.ResolverPreference)
+				if famErr != nil {
+					return nil, famErr
+				}
+			}
+			// Narrow the dial network to the resolved family so that resolver_preference
+			// is enforced at Dial time rather than left to Go's Happy Eyeballs default
+			// (which prefers IPv6 on dual-stack targets). When destFam == 0 (both new
+			// features unset), dialNetwork is left as addr.Network for full backward
+			// compat. Already-specific networks (tcp4/tcp6/udp4/udp6/unix*) are untouched.
+			dialNetwork = narrowNetworkForFamily(addr.Network, destFam)
+			localAddrs = buildLocalAddrs(resolvedLocalAddrs, dialNetwork, destFam, h.logger)
+		}
 
 		if upstream.TLS == nil {
-			up, err = dialWithLocalAddrs(localAddrs, dialNetwork, hostPort)
+			if upstream.NetworkProxy != nil {
+				up, err = upstream.NetworkProxy.dial(context.Background(), repl, resolvedLocalAddrs, upstream.ResolverPreference, dialNetwork, hostPort, h.logger)
+			} else {
+				up, err = dialWithLocalAddrs(localAddrs, dialNetwork, hostPort)
+			}
 		} else {
 			// The prepared config could be nil, if the user enabled but did not customize TLS
 			tlsCfg := upstream.tlsConfig
@@ -296,7 +309,19 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
 				newTLSCfg.ServerName = valServerName
 				tlsCfg = newTLSCfg
 			}
-			up, err = tlsDialWithLocalAddrs(localAddrs, dialNetwork, hostPort, tlsCfg)
+			if upstream.NetworkProxy != nil {
+				up, err = upstream.NetworkProxy.dial(context.Background(), repl, resolvedLocalAddrs, upstream.ResolverPreference, dialNetwork, hostPort, h.logger)
+				if err == nil {
+					tlsConn := tls.Client(up, tlsCfg)
+					if err = tlsConn.Handshake(); err != nil {
+						_ = up.Close()
+					} else {
+						up = tlsConn
+					}
+				}
+			} else {
+				up, err = tlsDialWithLocalAddrs(localAddrs, dialNetwork, hostPort, tlsCfg)
+			}
 		}
 		h.logger.Debug("dial upstream",
 			zap.String("remote", down.RemoteAddr().String()),
@@ -314,7 +339,7 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
 				// for packet connection, prepend each message with pp
 				// unix connections always implement this interface while not necessarily in datagram mode
 				// ignore it unless the unix socket is in datagram mode
-				if _, ok := up.(net.PacketConn); ok && (!caddy.IsUnixNetwork(p.address.Network) || p.address.Network == "unixgram") {
+				if _, ok := up.(net.PacketConn); ok && (!caddy.IsUnixNetwork(addr.Network) || addr.Network == "unixgram") {
 					// only v2 supports UDP addresses
 					if header.Version == 2 {
 						la, _ := header.DestinationAddr.(*net.UDPAddr)

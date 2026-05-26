@@ -36,6 +36,23 @@
 				}
 			}
 		}
+		0.0.0.0:9443 {
+			route {
+				proxy {
+					upstream onion.example:443 {
+						network_proxy socks5 {
+							dial unix//srv/avon/sockets/proxy/tor/socks.sock
+						}
+					}
+					upstream connect.example:8443 {
+						network_proxy url http://127.0.0.1:3128
+					}
+					upstream inherited-port.example {
+						network_proxy url http://127.0.0.1:3129
+					}
+				}
+			}
+		}
 	}
 }
 ----------
@@ -123,6 +140,51 @@
 											"tls": {
 												"insecure_skip_verify": true,
 												"renegotiation": "once"
+											}
+										}
+									]
+								}
+							]
+						}
+					]
+				},
+				"srv2": {
+					"listen": [
+						"0.0.0.0:9443"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handler": "proxy",
+									"upstreams": [
+										{
+											"dial": [
+												"onion.example:443"
+											],
+											"network_proxy": {
+												"dial": [
+													"unix//srv/avon/sockets/proxy/tor/socks.sock"
+												],
+												"from": "socks5"
+											}
+										},
+										{
+											"dial": [
+												"connect.example:8443"
+											],
+											"network_proxy": {
+												"from": "url",
+												"url": "http://127.0.0.1:3128"
+											}
+										},
+										{
+											"dial": [
+												"inherited-port.example"
+											],
+											"network_proxy": {
+												"from": "url",
+												"url": "http://127.0.0.1:3129"
 											}
 										}
 									]

@@ -118,6 +118,24 @@ Each `upstream` has the following fields:
   simply fall back to the OS default outbound address for the dialed family, which is the documented
   `local_address` behavior.
 
+- `network_proxy` optionally dials the upstream through a next-hop proxy. It supports two forms:
+  - `{"from":"socks5","dial":["unix//path/to/socks.sock"]}` uses a SOCKS5 proxy endpoint, including Unix sockets;
+  - `{"from":"url","url":"http://127.0.0.1:3128"}` uses an HTTP CONNECT proxy.
+
+  The upstream `dial` address remains the CONNECT target; the `network_proxy` address is only the proxy hop.
+  `network_proxy` supports TCP upstream targets. If the upstream address omits a port, the target port is inferred
+  from the inbound connection's local port. This supports listeners such as `:443` proxying to `upstream example.com`
+  as `example.com:443`. If the inbound local address has no usable port, such as a Unix socket listener, the
+  connection fails with an error instead of using port `0`. Direct upstream dialing is unchanged when
+  `network_proxy` is omitted. With `network_proxy`, `local_address` and `resolver_preference` apply to Caddy's
+  connection to the proxy endpoint, not to the proxy's connection to the final upstream target.
+  Active health checks also use the configured `network_proxy`; for host-only upstreams, set `health_port` because
+  background health checks do not have an inbound connection from which to infer a target port.
+
+  With TLS passthrough, Caddy may sniff the ClientHello for routing, but it does not terminate TLS and does not
+  rewrite SNI. The raw downstream bytes are copied through the proxy tunnel unchanged. Leave upstream `tls` unset
+  for passthrough; setting upstream `tls` makes Caddy initiate TLS to the upstream after the proxy tunnel is made.
+
 - `max_connections` may contain an integer value representing how many connections this upstream is allowed to have
   before being marked as unhealthy (if more than 0).
 
@@ -140,13 +158,16 @@ Each `upstream` has the following fields:
     | `tls_timeout`                              | `handshake_timeout`                                         |
     | `tls_trust_pool`                           | `ca`                                                        |
 
-Three fields support [placeholders](https://caddyserver.com/docs/conventions#placeholders).
+These fields support [placeholders](https://caddyserver.com/docs/conventions#placeholders).
 
 - `dial` (same as arguments after `upstream` and `proxy`) resolves placeholders two times: known once are replaced
   at provision, others are replaced at handle. E.g. `{l4.tls.server_name}:443` enables dynamic TLS SNI based upstreams.
 
 - `local_address` resolves placeholders two times as well: known ones are replaced at provision, others are replaced
   per-connection at handle.
+
+- `network_proxy` `socks5` dial addresses and `url` values resolve placeholders two times as well: known ones are
+  replaced at provision, others are replaced per-connection at handle.
 
 - `proxy_protocol` resolves placeholders at provision.
 
@@ -177,6 +198,10 @@ proxy [<upstreams...>] {
     upstream [<address:port>] {
         dial <address:port> [<address:port>]
         local_addr <address[:port]> [<address[:port]>]
+        network_proxy socks5 {
+            dial <proxy_address>
+        }
+        network_proxy url <http_proxy_url>
         resolver_preference <ipv4_only|ipv6_only|ipv4_first|ipv6_first>
         max_connections <int>
         
@@ -251,6 +276,49 @@ proxy 192.168.0.1:8080 {
         dial 192.168.0.3:8080
     }
 }
+```
+
+### Network Proxy Dialing
+
+SOCKS5 over a Unix socket:
+
+```caddyfile
+proxy {
+    upstream 4ewldglo6smqg7m7mmtuajxsqedo64cqxcbk6bbhilw6tfxefzelzaad.onion {
+        network_proxy socks5 {
+            dial unix//srv/avon/sockets/proxy/tor/socks.sock
+        }
+    }
+}
+```
+
+HTTP CONNECT with an explicit target port:
+
+```caddyfile
+proxy {
+    upstream git.example.net:443 {
+        network_proxy url http://127.0.0.1:3128
+    }
+}
+```
+
+HTTP CONNECT with the target port inherited from the inbound listener:
+
+```caddyfile
+proxy {
+    upstream git.example.net {
+        network_proxy url http://127.0.0.1:3128
+    }
+}
+```
+
+Equivalent JSON upstreams:
+
+```json
+[
+    {"dial": ["git.example.net:443"], "network_proxy": {"from": "url", "url": "http://127.0.0.1:3128"}},
+    {"dial": ["4ewldglo6smqg7m7mmtuajxsqedo64cqxcbk6bbhilw6tfxefzelzaad.onion"], "network_proxy": {"from": "socks5", "dial": ["unix//srv/avon/sockets/proxy/tor/socks.sock"]}}
+]
 ```
 
 An example config of the Layer 4 app that runs two proxies running on TCP4 ports 8765 and 9876 with some options
